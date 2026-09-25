@@ -3,27 +3,26 @@ HMT Watches — In-Stock Checker + Telegram Alert
 ------------------------------------------------
 Scans hmtwatches.in (Men + Women) via the site's internal
 `filter_products` endpoint and sends the current in-stock list
-to a Telegram chat.
+to a Telegram chat. 
 
-Run manually:
-    python hmt_stock_check.py
-
-Env vars required (set as GitHub Actions secrets, or a local .env):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
+UPDATED: 
+- Deduplicates watches that appear in both Men's and Women's sections.
+- Remembers previously alerted watches using a local JSON file to prevent spam looping.
 """
 
 import os
 import re
 import sys
 import time
+import json
 import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.hmtwatches.in"
 FILTER_URL = f"{BASE_URL}/filter_products"
+STATE_FILE = "previous_stock.json"
 
-# gender_type=1 -> Men, gender_type=2 -> Women (confirmed from live requests)
+# gender_type=1 -> Men, gender_type=2 -> Women
 GENDER_TYPES = {"men": 1, "women": 2}
 
 HEADERS = {
@@ -41,6 +40,23 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 PRICE_RE = re.compile(r"RS\.\s*([\d,]+)")
 
 
+def load_previous_stock():
+    """Load previously seen watch IDs to prevent duplicate alerts."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_current_stock(stock_ids):
+    """Save currently in-stock watch IDs for the next run."""
+    with open(STATE_FILE, "w") as f:
+        json.dump(list(stock_ids), f)
+
+
 def fetch_page(gender_type: int, load_more_count: int) -> str:
     """POST to filter_products and return the raw HTML fragment."""
     payload = {
@@ -49,7 +65,6 @@ def fetch_page(gender_type: int, load_more_count: int) -> str:
         "gender_type": gender_type,
     }
     
-    # Dynamically assign the correct referer
     req_headers = HEADERS.copy()
     referer_slug = "mens" if gender_type == 1 else "womens"
     req_headers["Referer"] = f"{BASE_URL}/{referer_slug}"
@@ -63,7 +78,7 @@ def fetch_page(gender_type: int, load_more_count: int) -> str:
 
 
 def parse_cards(html: str):
-    """Extract structured product info from a raw HTML fragment using BeautifulSoup."""
+    """Extract structured product info from a raw HTML fragment."""
     soup = BeautifulSoup(html, "html.parser")
     products = []
 
@@ -71,11 +86,9 @@ def parse_cards(html: str):
         link_tag = item.select_one("a.bc_p_img")
         url = link_tag["href"] if link_tag and link_tag.has_attr("href") else None
         
-        # If there's no URL, the card is malformed
         if not url:
             continue
 
-        # Extract numeric ID from the URL (e.g., ?id=123), or fallback to using the URL string as the ID
         id_match = re.search(r'id=(\d+)', url)
         product_id = id_match.group(1) if id_match else url
 
@@ -119,25 +132,28 @@ def scan_gender(gender_type: int, max_pages: int = 30, pause_sec: float = 1.0):
                 all_products[p["id"]] = p
                 new_count += 1
 
-        # If this page gave us nothing new, we've reached the end
         if new_count == 0:
             break
 
-        time.sleep(pause_sec)  # be polite to the server
+        time.sleep(pause_sec)
 
     return list(all_products.values())
 
 
 def scan_all():
-    """Scan both Men and Women categories, return combined in-stock list."""
-    in_stock = []
+    """Scan both categories and deduplicate cross-category overlap."""
+    in_stock = {}
     for label, gender_type in GENDER_TYPES.items():
         products = scan_gender(gender_type)
         for p in products:
             if p["in_stock"]:
-                p["category"] = label
-                in_stock.append(p)
-    return in_stock
+                # If watch is already found in another category, just append the label
+                if p["id"] in in_stock:
+                    in_stock[p["id"]]["category"] += f" & {label}"
+                else:
+                    p["category"] = label
+                    in_stock[p["id"]] = p
+    return list(in_stock.values())
 
 
 def send_telegram_message(text: str):
@@ -162,10 +178,7 @@ def send_telegram_message(text: str):
 
 
 def format_message(products):
-    if not products:
-        return "😴 No HMT watches currently in stock (Men or Women)."
-
-    lines = [f"✅ <b>{len(products)} HMT watch(es) in stock</b>\n"]
+    lines = [f"🆕 <b>{len(products)} NEW HMT watch(es) in stock!</b>\n"]
     for p in products:
         price = f"₹{p['price']}" if p["price"] else "Price N/A"
         lines.append(
@@ -177,12 +190,30 @@ def format_message(products):
 
 def main():
     print("Scanning HMT Watches (Men + Women)...")
-    in_stock = scan_all()
-    print(f"Found {len(in_stock)} in-stock item(s).")
+    current_in_stock = scan_all()
+    print(f"Found {len(current_in_stock)} total in-stock item(s) on the website.")
 
-    message = format_message(in_stock)
+    # 1. Load what we already notified you about last time
+    previous_stock_ids = load_previous_stock()
+    
+    # 2. Filter out watches we've already sent a message for
+    new_watches = []
+    current_stock_ids = set()
 
-    # Telegram messages have a ~4096 char limit — chunk if needed
+    for p in current_in_stock:
+        current_stock_ids.add(p["id"])
+        if p["id"] not in previous_stock_ids:
+            new_watches.append(p)
+            
+    # 3. Save the current state for the next run so it doesn't loop
+    save_current_stock(current_stock_ids)
+
+    if not new_watches:
+        print("No NEW watches found since last run. Skipping Telegram alert.")
+        return
+
+    message = format_message(new_watches)
+
     MAX_LEN = 3800
     if len(message) <= MAX_LEN:
         send_telegram_message(message)
