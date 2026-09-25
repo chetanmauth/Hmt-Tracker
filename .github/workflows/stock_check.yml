@@ -3,7 +3,7 @@ name: HMT Stock Check
 on:
   schedule:
     # Runs at minute 0 of every hour (UTC).
-    - cron: "0 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 jobs:
