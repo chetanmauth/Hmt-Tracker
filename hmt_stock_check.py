@@ -3,11 +3,15 @@ HMT Watches — In-Stock Checker + Telegram Alert
 ------------------------------------------------
 Scans hmtwatches.in (Men + Women) via the site's internal
 `filter_products` endpoint and sends the current in-stock list
-to a Telegram chat. 
+to a Telegram chat.
 
-UPDATED: 
-- Deduplicates watches that appear in both Men's and Women's sections.
-- Remembers previously alerted watches using a local JSON file to prevent spam looping.
+UPDATES INCLUDED:
+- Deduplicates watches that appear in multiple categories.
+- Deduplicates using full Name + Price to avoid dynamic URL looping.
+- Parses full watch names from HTML title attributes.
+- Uses absolute URLs for images.
+- Remembers previously alerted watches using a local JSON file.
+- Sends individual Telegram alerts with Photos.
 """
 
 import os
@@ -89,24 +93,35 @@ def parse_cards(html: str):
         if not url:
             continue
 
+        # Extract the full name from the link's title attribute instead of the truncated span
+        name_anchor = item.select_one("a.bc_p_name")
+        if name_anchor and name_anchor.has_attr("title"):
+            name = name_anchor["title"].strip()
+        else:
+            name_tag = item.select_one("a.bc_p_name span")
+            name = name_tag.get_text(strip=True) if name_tag else "Unknown"
+
         img_tag = item.select_one("a.bc_p_img img")
-        name_tag = item.select_one("a.bc_p_name span")
+        image_url = img_tag["src"] if img_tag and img_tag.has_attr("src") else None
+        
+        # Ensure the image URL is absolute so Telegram can download it
+        if image_url and not image_url.startswith("http"):
+            image_url = f"{BASE_URL}{image_url}"
+
         detail = item.select_one("div.bc_p_detail")
         price_tag = detail.find("p", recursive=False) if detail else None
-
-        name = name_tag.get_text(strip=True) if name_tag else "Unknown"
         price_text = price_tag.get_text(strip=True) if price_tag else ""
         price_match = PRICE_RE.search(price_text)
         price_val = price_match.group(1) if price_match else "N/A"
 
-        # Match duplicates by combining Name and Price
+        # Deduplicate using Full Name and Price
         product_id = f"{name}_{price_val}"
 
         product = {
             "id": product_id,
             "name": name,
             "price": price_val if price_val != "N/A" else None,
-            "image": img_tag["src"] if img_tag and img_tag.has_attr("src") else None,
+            "image": image_url,
             "url": url,
             "in_stock": item.select_one("div.outofstock") is None,
         }
@@ -157,36 +172,42 @@ def scan_all():
     return list(in_stock.values())
 
 
-def send_telegram_message(text: str):
+def send_telegram_alert(watch):
+    """Send an individual watch alert with an image card."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials missing — printing instead:\n")
-        print(text)
+        print(f"Would send alert for: {watch['name']}")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        data={
+    price = f"₹{watch['price']}" if watch['price'] else "Price N/A"
+    caption = (
+        f"🚨 <b>HMT IN STOCK</b> 🚨\n\n"
+        f"⌚️ <b>{watch['name']}</b>\n"
+        f"🏷 <b>Category:</b> {watch['category'].title()}\n"
+        f"💰 <b>Price:</b> {price}\n\n"
+        f"🛒 <a href='{watch['url']}'><b>BUY NOW</b></a>"
+    )
+
+    if watch["image"]:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        payload = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
+            "photo": watch["image"],
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+    else:
+        # Fallback to text message if image is missing
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": caption,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
-        },
-        timeout=20,
-    )
+        }
+        
+    resp = requests.post(url, data=payload, timeout=20)
     if not resp.ok:
         print(f"Telegram send failed: {resp.status_code} {resp.text}", file=sys.stderr)
-
-
-def format_message(products):
-    lines = [f"🆕 <b>{len(products)} NEW HMT watch(es) in stock!</b>\n"]
-    for p in products:
-        price = f"₹{p['price']}" if p["price"] else "Price N/A"
-        lines.append(
-            f"• <b>{p['name']}</b> ({p['category'].title()}) — {price}\n"
-            f"  {p['url']}"
-        )
-    return "\n".join(lines)
 
 
 def main():
@@ -194,10 +215,8 @@ def main():
     current_in_stock = scan_all()
     print(f"Found {len(current_in_stock)} total in-stock item(s) on the website.")
 
-    # 1. Load what we already notified you about last time
     previous_stock_ids = load_previous_stock()
     
-    # 2. Filter out watches we've already sent a message for
     new_watches = []
     current_stock_ids = set()
 
@@ -206,27 +225,26 @@ def main():
         if p["id"] not in previous_stock_ids:
             new_watches.append(p)
             
-    # 3. Save the current state for the next run so it doesn't loop
     save_current_stock(current_stock_ids)
 
     if not new_watches:
         print("No NEW watches found since last run. Skipping Telegram alert.")
         return
 
-    message = format_message(new_watches)
+    # Send a quick summary header text
+    summary_text = f"🆕 <b>{len(new_watches)} NEW HMT watch(es) in stock!</b>"
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": summary_text, "parse_mode": "HTML"},
+            timeout=20
+        )
 
-    MAX_LEN = 3800
-    if len(message) <= MAX_LEN:
-        send_telegram_message(message)
-    else:
-        chunk = ""
-        for line in message.split("\n"):
-            if len(chunk) + len(line) + 1 > MAX_LEN:
-                send_telegram_message(chunk)
-                chunk = ""
-            chunk += line + "\n"
-        if chunk.strip():
-            send_telegram_message(chunk)
+    # Send an individual image card for each new watch
+    for watch in new_watches:
+        send_telegram_alert(watch)
+        # Sleep for 1 second between photos to prevent Telegram API rate-limiting
+        time.sleep(1)
 
 
 if __name__ == "__main__":
