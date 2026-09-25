@@ -33,13 +33,11 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "X-Requested-With": "XMLHttpRequest",
-    "Referer": f"{BASE_URL}/mens",
 }
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-NOTIFY_ID_RE = re.compile(r"notifyMe\((\d+)\)")
 PRICE_RE = re.compile(r"RS\.\s*([\d,]+)")
 
 
@@ -50,7 +48,13 @@ def fetch_page(gender_type: int, load_more_count: int) -> str:
         "menu_val": "",
         "gender_type": gender_type,
     }
-    resp = requests.post(FILTER_URL, data=payload, headers=HEADERS, timeout=20)
+    
+    # Dynamically assign the correct referer
+    req_headers = HEADERS.copy()
+    referer_slug = "mens" if gender_type == 1 else "womens"
+    req_headers["Referer"] = f"{BASE_URL}/{referer_slug}"
+
+    resp = requests.post(FILTER_URL, data=payload, headers=req_headers, timeout=20)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("status"):
@@ -64,28 +68,32 @@ def parse_cards(html: str):
     products = []
 
     for item in soup.select("div.bc_p_item"):
-        # Numeric ID from the "Notify Me" onclick handler — our stable tracking key
-        notify_span = item.select_one('span[onclick^="notifyMe("]')
-        id_match = NOTIFY_ID_RE.search(notify_span["onclick"]) if notify_span else None
-        if not id_match:
-            continue  # skip anything we can't reliably track
+        link_tag = item.select_one("a.bc_p_img")
+        url = link_tag["href"] if link_tag and link_tag.has_attr("href") else None
+        
+        # If there's no URL, the card is malformed
+        if not url:
+            continue
+
+        # Extract numeric ID from the URL (e.g., ?id=123), or fallback to using the URL string as the ID
+        id_match = re.search(r'id=(\d+)', url)
+        product_id = id_match.group(1) if id_match else url
 
         img_tag = item.select_one("a.bc_p_img img")
         name_tag = item.select_one("a.bc_p_name span")
         detail = item.select_one("div.bc_p_detail")
         price_tag = detail.find("p", recursive=False) if detail else None
-        link_tag = item.select_one("a.bc_p_img")
 
         name = name_tag.get_text(strip=True) if name_tag else "Unknown"
         price_text = price_tag.get_text(strip=True) if price_tag else ""
         price_match = PRICE_RE.search(price_text)
 
         product = {
-            "id": id_match.group(1),
+            "id": product_id,
             "name": name,
             "price": price_match.group(1) if price_match else None,
             "image": img_tag["src"] if img_tag and img_tag.has_attr("src") else None,
-            "url": link_tag["href"] if link_tag and link_tag.has_attr("href") else None,
+            "url": url,
             "in_stock": item.select_one("div.outofstock") is None,
         }
         products.append(product)
