@@ -89,9 +89,6 @@ def parse_cards(html: str):
         if not url:
             continue
 
-        id_match = re.search(r'id=(\d+)', url)
-        product_id = id_match.group(1) if id_match else url
-
         img_tag = item.select_one("a.bc_p_img img")
         name_tag = item.select_one("a.bc_p_name span")
         detail = item.select_one("div.bc_p_detail")
@@ -100,11 +97,15 @@ def parse_cards(html: str):
         name = name_tag.get_text(strip=True) if name_tag else "Unknown"
         price_text = price_tag.get_text(strip=True) if price_tag else ""
         price_match = PRICE_RE.search(price_text)
+        price_val = price_match.group(1) if price_match else "N/A"
+
+        # Match duplicates by combining Name and Price
+        product_id = f"{name}_{price_val}"
 
         product = {
             "id": product_id,
             "name": name,
-            "price": price_match.group(1) if price_match else None,
+            "price": price_val if price_val != "N/A" else None,
             "image": img_tag["src"] if img_tag and img_tag.has_attr("src") else None,
             "url": url,
             "in_stock": item.select_one("div.outofstock") is None,
